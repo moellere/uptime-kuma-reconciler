@@ -30,6 +30,7 @@ ANNOTATION_ENABLED = "uptime-kuma.io/monitor"
 ANNOTATION_TYPE = "uptime-kuma.io/monitor-type"
 ANNOTATION_INTERVAL = "uptime-kuma.io/monitor-interval"
 ANNOTATION_GROUP = "uptime-kuma.io/monitor-group"
+ANNOTATION_PATH = "uptime-kuma.io/monitor-path"
 MANAGED_TAG = "managed-by-reconciler"
 STATIC_MONITORS_PATH = "/config/monitors.yaml"
 
@@ -38,6 +39,13 @@ MONITOR_TYPES = {
     "keyword": MonitorType.KEYWORD,
     "ping": MonitorType.PING,
     "port": MonitorType.PORT,
+}
+
+NAMESPACE_GROUPS = {
+    "nhb-": "Hypotheekbond",
+    "next-": "Finly",
+    "blinqx-": "Blinqx",
+    "yc-": "Yes-co",
 }
 
 shutdown_event = Event()
@@ -73,16 +81,33 @@ def ensure_tag(api):
     return result["id"]
 
 
-def ensure_group(api, group_name):
+def build_group_cache(api):
+    """Build a name→id map of all existing monitor groups."""
+    cache = {}
+    for m in api.get_monitors():
+        if m.get("type") == MonitorType.GROUP:
+            cache[m["name"]] = m["id"]
+    return cache
+
+
+def ensure_group(api, group_name, cache):
+    """Return group id, creating it if it doesn't exist. Updates cache in place."""
     if not group_name:
         return None
-    monitors = api.get_monitors()
-    for m in monitors:
-        if m.get("type") == MonitorType.GROUP and m.get("name") == group_name:
-            return m["id"]
+    if group_name in cache:
+        return cache[group_name]
     result = api.add_monitor(type=MonitorType.GROUP, name=group_name)
     log.info("Created monitor group: %s", group_name)
-    return result["monitorID"]
+    cache[group_name] = result["monitorID"]
+    return cache[group_name]
+
+
+def group_for_namespace(namespace):
+    """Derive a monitor group from a namespace prefix."""
+    for prefix, group in NAMESPACE_GROUPS.items():
+        if namespace.startswith(prefix):
+            return group
+    return ""
 
 
 def extract_url_from_resource(resource):
@@ -125,7 +150,7 @@ def build_monitor_key(resource):
     return f"{ns}/{kind}/{name}"
 
 
-def reconcile_resource(api, resource, managed, tag_id):
+def reconcile_resource(api, resource, managed, tag_id, group_cache):
     annotations = resource.get("metadata", {}).get("annotations") or {}
     enabled = annotations.get(ANNOTATION_ENABLED, "").lower() == "true"
     key = build_monitor_key(resource)
@@ -144,11 +169,18 @@ def reconcile_resource(api, resource, managed, tag_id):
         log.warning("Cannot extract URL from %s, skipping", key)
         return
 
+    path = annotations.get(ANNOTATION_PATH, "")
+    if path:
+        url = url.rstrip("/") + "/" + path.lstrip("/")
+
     monitor_type_str = annotations.get(ANNOTATION_TYPE, "http").lower()
     monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
     interval = int(annotations.get(ANNOTATION_INTERVAL, "60"))
-    group_name = annotations.get(ANNOTATION_GROUP, "")
-    parent_id = ensure_group(api, group_name) if group_name else None
+    namespace = resource.get("metadata", {}).get("namespace", "")
+    group_name = annotations.get(ANNOTATION_GROUP, "") or group_for_namespace(namespace)
+    parent_id = ensure_group(api, group_name, group_cache) if group_name else None
+
+    monitor_name = key
 
     if key in managed:
         existing = managed[key]
@@ -156,12 +188,13 @@ def reconcile_resource(api, resource, managed, tag_id):
             existing.get("url") != url
             or existing.get("interval") != interval
             or existing.get("type") != monitor_type
+            or existing.get("name") != monitor_name
         )
         if needs_update:
             log.info("Updating monitor %s -> %s", key, url)
             try:
                 kwargs = dict(
-                    type=monitor_type, name=key, url=url,
+                    type=monitor_type, name=monitor_name, url=url,
                     interval=interval, retryInterval=60, maxretries=3,
                 )
                 if parent_id is not None:
@@ -173,7 +206,7 @@ def reconcile_resource(api, resource, managed, tag_id):
         log.info("Creating monitor %s -> %s", key, url)
         try:
             kwargs = dict(
-                type=monitor_type, name=key, url=url,
+                type=monitor_type, name=monitor_name, url=url,
                 interval=interval, retryInterval=60, maxretries=3,
             )
             if parent_id is not None:
@@ -202,7 +235,7 @@ def load_static_monitors():
         return []
 
 
-def reconcile_static_monitors(api, managed, tag_id):
+def reconcile_static_monitors(api, managed, tag_id, group_cache):
     """Create/update monitors from static definitions."""
     static_defs = load_static_monitors()
     seen_keys = set()
@@ -219,7 +252,7 @@ def reconcile_static_monitors(api, managed, tag_id):
         monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
         interval = int(entry.get("interval", 60))
         group_name = entry.get("group", "")
-        parent_id = ensure_group(api, group_name) if group_name else None
+        parent_id = ensure_group(api, group_name, group_cache) if group_name else None
 
         kwargs = dict(
             type=monitor_type,
@@ -303,85 +336,103 @@ def full_reconcile(api, tag_id):
     except config.ConfigException:
         config.load_kube_config()
 
-    v1net = client.NetworkingV1Api()
-    custom = client.CustomObjectsApi()
-
-    managed = get_managed_monitors(api)
-    seen_keys = set()
-
-    # --- Static monitors from ConfigMap ---
-    static_keys = reconcile_static_monitors(api, managed, tag_id)
-    seen_keys.update(static_keys)
-
-    # --- Auto-discovered Kubernetes resources ---
-
-    # Standard Ingress resources
+    # One ApiClient per reconcile: NetworkingV1Api/CustomObjectsApi default ctor
+    # each spawn their own client; per-Ingress ApiClient() leaked pools/threads.
+    k8s_client = None
     try:
-        ingresses = v1net.list_ingress_for_all_namespaces()
-        for ing in ingresses.items:
-            resource = {
-                "kind": "Ingress",
-                "metadata": {
-                    "name": ing.metadata.name,
-                    "namespace": ing.metadata.namespace,
-                    "annotations": ing.metadata.annotations or {},
-                },
-                "spec": client.ApiClient().sanitize_for_serialization(ing.spec),
-            }
-            key = build_monitor_key(resource)
-            seen_keys.add(key)
-            reconcile_resource(api, resource, managed, tag_id)
-    except Exception as e:
-        log.error("Error listing Ingresses: %s", e)
+        k8s_client = client.ApiClient()
+        v1net = client.NetworkingV1Api(api_client=k8s_client)
+        custom = client.CustomObjectsApi(api_client=k8s_client)
 
-    # Traefik IngressRoute CRDs
-    try:
-        ingressroutes = custom.list_cluster_custom_object(
-            "traefik.io", "v1alpha1", "ingressroutes"
+        managed = get_managed_monitors(api)
+        group_cache = build_group_cache(api)
+        seen_keys = set()
+
+        # --- Static monitors from ConfigMap ---
+        static_keys = reconcile_static_monitors(api, managed, tag_id, group_cache)
+        seen_keys.update(static_keys)
+
+        # --- Auto-discovered Kubernetes resources ---
+
+        # Standard Ingress resources
+        try:
+            ingresses = v1net.list_ingress_for_all_namespaces()
+            for ing in ingresses.items:
+                resource = {
+                    "kind": "Ingress",
+                    "metadata": {
+                        "name": ing.metadata.name,
+                        "namespace": ing.metadata.namespace,
+                        "annotations": ing.metadata.annotations or {},
+                    },
+                    "spec": k8s_client.sanitize_for_serialization(ing.spec),
+                }
+                key = build_monitor_key(resource)
+                seen_keys.add(key)
+                reconcile_resource(api, resource, managed, tag_id, group_cache)
+        except Exception as e:
+            log.error("Error listing Ingresses: %s", e)
+
+        # Traefik IngressRoute CRDs
+        try:
+            ingressroutes = custom.list_cluster_custom_object(
+                "traefik.io", "v1alpha1", "ingressroutes"
+            )
+            for ir in ingressroutes.get("items", []):
+                ir["kind"] = "IngressRoute"
+                key = build_monitor_key(ir)
+                seen_keys.add(key)
+                reconcile_resource(api, ir, managed, tag_id, group_cache)
+        except Exception as e:
+            log.debug("IngressRoute CRD not available: %s", e)
+
+        # Gateway API HTTPRoute
+        try:
+            httproutes = custom.list_cluster_custom_object(
+                "gateway.networking.k8s.io", "v1", "httproutes"
+            )
+            for hr in httproutes.get("items", []):
+                hr["kind"] = "HTTPRoute"
+                key = build_monitor_key(hr)
+                seen_keys.add(key)
+                reconcile_resource(api, hr, managed, tag_id, group_cache)
+        except Exception as e:
+            log.debug("HTTPRoute CRD not available: %s", e)
+
+        # Delete monitors for resources that no longer exist
+        for key, monitor in managed.items():
+            if key not in seen_keys:
+                log.info("Deleting orphan monitor %s (resource gone)", key)
+                try:
+                    api.delete_monitor(monitor["id"])
+                except Exception as e:
+                    log.error("Failed to delete orphan monitor %s: %s", key, e)
+
+        log.info(
+            "Full reconciliation complete. Tracked %d resources (%d static, %d discovered).",
+            len(seen_keys), len(static_keys), len(seen_keys) - len(static_keys),
         )
-        for ir in ingressroutes.get("items", []):
-            ir["kind"] = "IngressRoute"
-            key = build_monitor_key(ir)
-            seen_keys.add(key)
-            reconcile_resource(api, ir, managed, tag_id)
-    except Exception as e:
-        log.debug("IngressRoute CRD not available: %s", e)
-
-    # Gateway API HTTPRoute
-    try:
-        httproutes = custom.list_cluster_custom_object(
-            "gateway.networking.k8s.io", "v1", "httproutes"
-        )
-        for hr in httproutes.get("items", []):
-            hr["kind"] = "HTTPRoute"
-            key = build_monitor_key(hr)
-            seen_keys.add(key)
-            reconcile_resource(api, hr, managed, tag_id)
-    except Exception as e:
-        log.debug("HTTPRoute CRD not available: %s", e)
-
-    # Delete monitors for resources that no longer exist
-    for key, monitor in managed.items():
-        if key not in seen_keys:
-            log.info("Deleting orphan monitor %s (resource gone)", key)
-            try:
-                api.delete_monitor(monitor["id"])
-            except Exception as e:
-                log.error("Failed to delete orphan monitor %s: %s", key, e)
-
-    log.info(
-        "Full reconciliation complete. Tracked %d resources (%d static, %d discovered).",
-        len(seen_keys), len(static_keys), len(seen_keys) - len(static_keys),
-    )
+    finally:
+        if k8s_client is not None:
+            k8s_client.close()
 
 
-def watch_loop(api, tag_id):
+def watch_loop(kuma_url, username, password):
     resync_interval = int(os.environ.get("RESYNC_INTERVAL", "300"))
     while not shutdown_event.is_set():
+        api = None
         try:
+            api = connect_kuma(kuma_url, username, password)
+            tag_id = ensure_tag(api)
             full_reconcile(api, tag_id)
         except Exception as e:
-            log.error("Reconciliation error: %s", e)
+            log.error("Reconciliation error: %s", e, exc_info=True)
+        finally:
+            if api is not None:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
         shutdown_event.wait(timeout=resync_interval)
 
 
@@ -393,14 +444,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    while not shutdown_event.is_set():
-        try:
-            api = connect_kuma(kuma_url, username, password)
-            tag_id = ensure_tag(api)
-            watch_loop(api, tag_id)
-        except Exception as e:
-            log.error("Connection error: %s — retrying in 30s", e)
-            shutdown_event.wait(timeout=30)
+    watch_loop(kuma_url, username, password)
 
     log.info("Reconciler shut down.")
 
