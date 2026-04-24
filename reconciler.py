@@ -16,6 +16,8 @@ import sys
 import time
 from threading import Event
 
+import json
+
 import yaml
 from kubernetes import client, config, watch
 from uptime_kuma_api import UptimeKumaApi, MonitorType
@@ -95,6 +97,22 @@ def ensure_group(api, group_name, cache):
     return cache[group_name]
 
 
+def load_namespace_groups():
+    raw = os.environ.get("NAMESPACE_GROUPS", "{}")
+    try:
+        return json.loads(raw)
+    except Exception:
+        log.warning("Invalid NAMESPACE_GROUPS env var, namespace grouping disabled")
+        return {}
+
+
+def group_for_namespace(namespace, namespace_groups):
+    for prefix, group in namespace_groups.items():
+        if namespace.startswith(prefix):
+            return group
+    return ""
+
+
 def extract_url_from_resource(resource):
     kind = resource.get("kind", "")
     spec = resource.get("spec", {})
@@ -135,7 +153,7 @@ def build_monitor_key(resource):
     return f"{ns}/{kind}/{name}"
 
 
-def reconcile_resource(api, resource, managed, tag_id, group_cache):
+def reconcile_resource(api, resource, managed, tag_id, group_cache, namespace_groups):
     annotations = resource.get("metadata", {}).get("annotations") or {}
     enabled = annotations.get(ANNOTATION_ENABLED, "").lower() == "true"
     key = build_monitor_key(resource)
@@ -161,7 +179,8 @@ def reconcile_resource(api, resource, managed, tag_id, group_cache):
     monitor_type_str = annotations.get(ANNOTATION_TYPE, "http").lower()
     monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
     interval = int(annotations.get(ANNOTATION_INTERVAL, "60"))
-    group_name = annotations.get(ANNOTATION_GROUP, "")
+    namespace = resource.get("metadata", {}).get("namespace", "")
+    group_name = annotations.get(ANNOTATION_GROUP, "") or group_for_namespace(namespace, namespace_groups)
     parent_id = ensure_group(api, group_name, group_cache) if group_name else None
 
     monitor_name = key
@@ -330,6 +349,7 @@ def full_reconcile(api, tag_id):
 
         managed = get_managed_monitors(api)
         group_cache = build_group_cache(api)
+        namespace_groups = load_namespace_groups()
         seen_keys = set()
 
         # --- Static monitors from ConfigMap ---
@@ -353,7 +373,7 @@ def full_reconcile(api, tag_id):
                 }
                 key = build_monitor_key(resource)
                 seen_keys.add(key)
-                reconcile_resource(api, resource, managed, tag_id, group_cache)
+                reconcile_resource(api, resource, managed, tag_id, group_cache, namespace_groups)
         except Exception as e:
             log.error("Error listing Ingresses: %s", e)
 
@@ -366,7 +386,7 @@ def full_reconcile(api, tag_id):
                 ir["kind"] = "IngressRoute"
                 key = build_monitor_key(ir)
                 seen_keys.add(key)
-                reconcile_resource(api, ir, managed, tag_id, group_cache)
+                reconcile_resource(api, ir, managed, tag_id, group_cache, namespace_groups)
         except Exception as e:
             log.debug("IngressRoute CRD not available: %s", e)
 
@@ -379,7 +399,7 @@ def full_reconcile(api, tag_id):
                 hr["kind"] = "HTTPRoute"
                 key = build_monitor_key(hr)
                 seen_keys.add(key)
-                reconcile_resource(api, hr, managed, tag_id, group_cache)
+                reconcile_resource(api, hr, managed, tag_id, group_cache, namespace_groups)
         except Exception as e:
             log.debug("HTTPRoute CRD not available: %s", e)
 
