@@ -403,21 +403,22 @@ def full_reconcile(api, tag_id):
 
 def watch_loop(kuma_url, username, password):
     resync_interval = int(os.environ.get("RESYNC_INTERVAL", "300"))
-    while not shutdown_event.is_set():
-        api = None
-        try:
-            api = connect_kuma(kuma_url, username, password)
-            tag_id = ensure_tag(api)
-            full_reconcile(api, tag_id)
-        except Exception as e:
-            log.error("Reconciliation error: %s", e, exc_info=True)
-        finally:
-            if api is not None:
-                try:
-                    api.disconnect()
-                except Exception:
-                    pass
-        shutdown_event.wait(timeout=resync_interval)
+    api = None
+    try:
+        api = connect_kuma(kuma_url, username, password)
+        tag_id = ensure_tag(api)
+        while not shutdown_event.is_set():
+            try:
+                full_reconcile(api, tag_id)
+            except Exception as e:
+                log.error("Reconciliation error: %s", e, exc_info=True)
+            shutdown_event.wait(timeout=resync_interval)
+    finally:
+        if api is not None:
+            try:
+                api.disconnect()
+            except Exception:
+                pass
 
 
 def main():
