@@ -30,6 +30,7 @@ ANNOTATION_ENABLED = "uptime-kuma.io/monitor"
 ANNOTATION_TYPE = "uptime-kuma.io/monitor-type"
 ANNOTATION_INTERVAL = "uptime-kuma.io/monitor-interval"
 ANNOTATION_GROUP = "uptime-kuma.io/monitor-group"
+ANNOTATION_PATH = "uptime-kuma.io/monitor-path"
 MANAGED_TAG = "managed-by-reconciler"
 STATIC_MONITORS_PATH = "/config/monitors.yaml"
 
@@ -143,6 +144,10 @@ def reconcile_resource(api, resource, managed, tag_id):
     if not url:
         log.warning("Cannot extract URL from %s, skipping", key)
         return
+
+    path = annotations.get(ANNOTATION_PATH, "")
+    if path:
+        url = url.rstrip("/") + "/" + path.lstrip("/")
 
     monitor_type_str = annotations.get(ANNOTATION_TYPE, "http").lower()
     monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
