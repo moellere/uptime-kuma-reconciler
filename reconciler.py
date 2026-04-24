@@ -41,13 +41,6 @@ MONITOR_TYPES = {
     "port": MonitorType.PORT,
 }
 
-NAMESPACE_GROUPS = {
-    "nhb-": "Hypotheekbond",
-    "next-": "Finly",
-    "blinqx-": "Blinqx",
-    "yc-": "Yes-co",
-}
-
 shutdown_event = Event()
 
 
@@ -100,14 +93,6 @@ def ensure_group(api, group_name, cache):
     log.info("Created monitor group: %s", group_name)
     cache[group_name] = result["monitorID"]
     return cache[group_name]
-
-
-def group_for_namespace(namespace):
-    """Derive a monitor group from a namespace prefix."""
-    for prefix, group in NAMESPACE_GROUPS.items():
-        if namespace.startswith(prefix):
-            return group
-    return ""
 
 
 def extract_url_from_resource(resource):
@@ -176,8 +161,7 @@ def reconcile_resource(api, resource, managed, tag_id, group_cache):
     monitor_type_str = annotations.get(ANNOTATION_TYPE, "http").lower()
     monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
     interval = int(annotations.get(ANNOTATION_INTERVAL, "60"))
-    namespace = resource.get("metadata", {}).get("namespace", "")
-    group_name = annotations.get(ANNOTATION_GROUP, "") or group_for_namespace(namespace)
+    group_name = annotations.get(ANNOTATION_GROUP, "")
     parent_id = ensure_group(api, group_name, group_cache) if group_name else None
 
     monitor_name = key
