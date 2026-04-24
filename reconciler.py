@@ -73,16 +73,23 @@ def ensure_tag(api):
     return result["id"]
 
 
-def ensure_group(api, group_name):
+def build_group_cache(api):
+    cache = {}
+    for m in api.get_monitors():
+        if m.get("type") == MonitorType.GROUP:
+            cache[m["name"]] = m["id"]
+    return cache
+
+
+def ensure_group(api, group_name, cache):
     if not group_name:
         return None
-    monitors = api.get_monitors()
-    for m in monitors:
-        if m.get("type") == MonitorType.GROUP and m.get("name") == group_name:
-            return m["id"]
+    if group_name in cache:
+        return cache[group_name]
     result = api.add_monitor(type=MonitorType.GROUP, name=group_name)
     log.info("Created monitor group: %s", group_name)
-    return result["monitorID"]
+    cache[group_name] = result["monitorID"]
+    return cache[group_name]
 
 
 def extract_url_from_resource(resource):
@@ -125,7 +132,7 @@ def build_monitor_key(resource):
     return f"{ns}/{kind}/{name}"
 
 
-def reconcile_resource(api, resource, managed, tag_id):
+def reconcile_resource(api, resource, managed, tag_id, group_cache):
     annotations = resource.get("metadata", {}).get("annotations") or {}
     enabled = annotations.get(ANNOTATION_ENABLED, "").lower() == "true"
     key = build_monitor_key(resource)
@@ -148,7 +155,7 @@ def reconcile_resource(api, resource, managed, tag_id):
     monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
     interval = int(annotations.get(ANNOTATION_INTERVAL, "60"))
     group_name = annotations.get(ANNOTATION_GROUP, "")
-    parent_id = ensure_group(api, group_name) if group_name else None
+    parent_id = ensure_group(api, group_name, group_cache) if group_name else None
 
     if key in managed:
         existing = managed[key]
@@ -202,7 +209,7 @@ def load_static_monitors():
         return []
 
 
-def reconcile_static_monitors(api, managed, tag_id):
+def reconcile_static_monitors(api, managed, tag_id, group_cache):
     """Create/update monitors from static definitions."""
     static_defs = load_static_monitors()
     seen_keys = set()
@@ -219,7 +226,7 @@ def reconcile_static_monitors(api, managed, tag_id):
         monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
         interval = int(entry.get("interval", 60))
         group_name = entry.get("group", "")
-        parent_id = ensure_group(api, group_name) if group_name else None
+        parent_id = ensure_group(api, group_name, group_cache) if group_name else None
 
         kwargs = dict(
             type=monitor_type,
@@ -307,10 +314,11 @@ def full_reconcile(api, tag_id):
     custom = client.CustomObjectsApi()
 
     managed = get_managed_monitors(api)
+    group_cache = build_group_cache(api)
     seen_keys = set()
 
     # --- Static monitors from ConfigMap ---
-    static_keys = reconcile_static_monitors(api, managed, tag_id)
+    static_keys = reconcile_static_monitors(api, managed, tag_id, group_cache)
     seen_keys.update(static_keys)
 
     # --- Auto-discovered Kubernetes resources ---
@@ -330,7 +338,7 @@ def full_reconcile(api, tag_id):
             }
             key = build_monitor_key(resource)
             seen_keys.add(key)
-            reconcile_resource(api, resource, managed, tag_id)
+            reconcile_resource(api, resource, managed, tag_id, group_cache)
     except Exception as e:
         log.error("Error listing Ingresses: %s", e)
 
@@ -343,7 +351,7 @@ def full_reconcile(api, tag_id):
             ir["kind"] = "IngressRoute"
             key = build_monitor_key(ir)
             seen_keys.add(key)
-            reconcile_resource(api, ir, managed, tag_id)
+            reconcile_resource(api, ir, managed, tag_id, group_cache)
     except Exception as e:
         log.debug("IngressRoute CRD not available: %s", e)
 
@@ -356,7 +364,7 @@ def full_reconcile(api, tag_id):
             hr["kind"] = "HTTPRoute"
             key = build_monitor_key(hr)
             seen_keys.add(key)
-            reconcile_resource(api, hr, managed, tag_id)
+            reconcile_resource(api, hr, managed, tag_id, group_cache)
     except Exception as e:
         log.debug("HTTPRoute CRD not available: %s", e)
 
