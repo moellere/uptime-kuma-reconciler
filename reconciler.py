@@ -303,76 +303,85 @@ def full_reconcile(api, tag_id):
     except config.ConfigException:
         config.load_kube_config()
 
-    v1net = client.NetworkingV1Api()
-    custom = client.CustomObjectsApi()
-
-    managed = get_managed_monitors(api)
-    seen_keys = set()
-
-    # --- Static monitors from ConfigMap ---
-    static_keys = reconcile_static_monitors(api, managed, tag_id)
-    seen_keys.update(static_keys)
-
-    # --- Auto-discovered Kubernetes resources ---
-
-    # Standard Ingress resources
+    k8s_client = None
     try:
-        ingresses = v1net.list_ingress_for_all_namespaces()
-        for ing in ingresses.items:
-            resource = {
-                "kind": "Ingress",
-                "metadata": {
-                    "name": ing.metadata.name,
-                    "namespace": ing.metadata.namespace,
-                    "annotations": ing.metadata.annotations or {},
-                },
-                "spec": client.ApiClient().sanitize_for_serialization(ing.spec),
-            }
-            key = build_monitor_key(resource)
-            seen_keys.add(key)
-            reconcile_resource(api, resource, managed, tag_id)
-    except Exception as e:
-        log.error("Error listing Ingresses: %s", e)
+        k8s_client = client.ApiClient()
+        v1net = client.NetworkingV1Api(api_client=k8s_client)
+        custom = client.CustomObjectsApi(api_client=k8s_client)
 
-    # Traefik IngressRoute CRDs
-    try:
-        ingressroutes = custom.list_cluster_custom_object(
-            "traefik.io", "v1alpha1", "ingressroutes"
+        managed = get_managed_monitors(api)
+        seen_keys = set()
+
+        # --- Static monitors from ConfigMap ---
+        static_keys = reconcile_static_monitors(api, managed, tag_id)
+        seen_keys.update(static_keys)
+
+        # --- Auto-discovered Kubernetes resources ---
+
+        # Standard Ingress resources
+        try:
+            ingresses = v1net.list_ingress_for_all_namespaces()
+            for ing in ingresses.items:
+                resource = {
+                    "kind": "Ingress",
+                    "metadata": {
+                        "name": ing.metadata.name,
+                        "namespace": ing.metadata.namespace,
+                        "annotations": ing.metadata.annotations or {},
+                    },
+                    "spec": k8s_client.sanitize_for_serialization(ing.spec),
+                }
+                key = build_monitor_key(resource)
+                seen_keys.add(key)
+                reconcile_resource(api, resource, managed, tag_id)
+        except Exception as e:
+            log.error("Error listing Ingresses: %s", e)
+
+        # Traefik IngressRoute CRDs
+        try:
+            ingressroutes = custom.list_cluster_custom_object(
+                "traefik.io", "v1alpha1", "ingressroutes"
+            )
+            for ir in ingressroutes.get("items", []):
+                ir["kind"] = "IngressRoute"
+                key = build_monitor_key(ir)
+                seen_keys.add(key)
+                reconcile_resource(api, ir, managed, tag_id)
+        except Exception as e:
+            log.debug("IngressRoute CRD not available: %s", e)
+
+        # Gateway API HTTPRoute
+        try:
+            httproutes = custom.list_cluster_custom_object(
+                "gateway.networking.k8s.io", "v1", "httproutes"
+            )
+            for hr in httproutes.get("items", []):
+                hr["kind"] = "HTTPRoute"
+                key = build_monitor_key(hr)
+                seen_keys.add(key)
+                reconcile_resource(api, hr, managed, tag_id)
+        except Exception as e:
+            log.debug("HTTPRoute CRD not available: %s", e)
+
+        # Delete monitors for resources that no longer exist
+        for key, monitor in managed.items():
+            if key not in seen_keys:
+                log.info("Deleting orphan monitor %s (resource gone)", key)
+                try:
+                    api.delete_monitor(monitor["id"])
+                except Exception as e:
+                    log.error("Failed to delete orphan monitor %s: %s", key, e)
+
+        log.info(
+            "Full reconciliation complete. Tracked %d resources (%d static, %d discovered).",
+            len(seen_keys), len(static_keys), len(seen_keys) - len(static_keys),
         )
-        for ir in ingressroutes.get("items", []):
-            ir["kind"] = "IngressRoute"
-            key = build_monitor_key(ir)
-            seen_keys.add(key)
-            reconcile_resource(api, ir, managed, tag_id)
-    except Exception as e:
-        log.debug("IngressRoute CRD not available: %s", e)
-
-    # Gateway API HTTPRoute
-    try:
-        httproutes = custom.list_cluster_custom_object(
-            "gateway.networking.k8s.io", "v1", "httproutes"
-        )
-        for hr in httproutes.get("items", []):
-            hr["kind"] = "HTTPRoute"
-            key = build_monitor_key(hr)
-            seen_keys.add(key)
-            reconcile_resource(api, hr, managed, tag_id)
-    except Exception as e:
-        log.debug("HTTPRoute CRD not available: %s", e)
-
-    # Delete monitors for resources that no longer exist
-    for key, monitor in managed.items():
-        if key not in seen_keys:
-            log.info("Deleting orphan monitor %s (resource gone)", key)
+    finally:
+        if k8s_client is not None:
             try:
-                api.delete_monitor(monitor["id"])
-            except Exception as e:
-                log.error("Failed to delete orphan monitor %s: %s", key, e)
-
-    log.info(
-        "Full reconciliation complete. Tracked %d resources (%d static, %d discovered).",
-        len(seen_keys), len(static_keys), len(seen_keys) - len(static_keys),
-    )
+                k8s_client.close()
+            except Exception:
+                pass
 
 
 def watch_loop(api, tag_id):
