@@ -16,9 +16,148 @@ import sys
 import time
 from threading import Event
 
+import threading
+
+import socketio
 import yaml
 from kubernetes import client, config, watch
-from uptime_kuma_api import UptimeKumaApi, MonitorType
+
+
+# ---------------------------------------------------------------------------
+# Uptime Kuma v2 Socket.IO client (replaces lucasheld/uptime-kuma-api).
+#
+# uptime-kuma-api only supports Uptime Kuma <= 1.23.2. v2 changed the login
+# handshake — the "login" ack now returns {ok, tokenRequired} instead of the
+# v1 shape — so the old library connects but never authenticates, and every
+# write fails with "You are not logged in". This minimal client speaks the v2
+# protocol directly and exposes just the surface the reconciler uses.
+# ---------------------------------------------------------------------------
+class MonitorType:
+    HTTP = "http"
+    KEYWORD = "keyword"
+    PING = "ping"
+    PORT = "port"
+    GROUP = "group"
+
+
+class UptimeKumaApi:
+    def __init__(self, url, timeout=30):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self._monitor_list = {}
+        self._ml_event = threading.Event()
+        self.sio = socketio.Client(
+            reconnection=False, logger=False, engineio_logger=False
+        )
+
+        @self.sio.on("monitorList")
+        def _on_monitor_list(data):
+            self._monitor_list = data or {}
+            self._ml_event.set()
+
+        self.sio.connect(
+            self.url,
+            socketio_path="socket.io",
+            transports=["websocket", "polling"],
+            wait=True,
+            wait_timeout=timeout,
+        )
+
+    def login(self, username, password, token=""):
+        payload = {"username": username, "password": password}
+        if token:
+            payload["token"] = token
+        res = self.sio.call("login", payload, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            if isinstance(res, dict) and res.get("tokenRequired"):
+                raise RuntimeError(
+                    "Uptime Kuma requires 2FA but no token is configured"
+                )
+            raise RuntimeError(f"login failed: {res}")
+        # Server auto-pushes monitorList after a successful login.
+        self._ml_event.wait(self.timeout)
+        return res
+
+    def _refresh_monitor_list(self):
+        """Best-effort wait for the server to push an updated monitorList
+        after a mutation, so the next get_monitors() reflects the change."""
+        self._ml_event.clear()
+        self._ml_event.wait(2)
+
+    def get_monitors(self):
+        monitors = []
+        for mid, m in (self._monitor_list or {}).items():
+            mm = dict(m)
+            mm.setdefault("id", int(mid) if str(mid).isdigit() else mid)
+            monitors.append(mm)
+        return monitors
+
+    def _find_cached(self, monitor_id):
+        for mid, m in (self._monitor_list or {}).items():
+            cid = int(mid) if str(mid).isdigit() else mid
+            if cid == monitor_id:
+                return dict(m)
+        return {}
+
+    def get_tags(self):
+        res = self.sio.call("getTags", timeout=self.timeout)
+        if isinstance(res, dict):
+            return res.get("tags", [])
+        return res or []
+
+    def add_tag(self, name, color):
+        res = self.sio.call(
+            "addTag", {"name": name, "color": color}, timeout=self.timeout
+        )
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"addTag failed: {res}")
+        tag = res.get("tag")
+        if isinstance(tag, dict) and "id" in tag:
+            return tag
+        for t in self.get_tags():  # fallback: resolve id by name
+            if t.get("name") == name:
+                return t
+        raise RuntimeError(f"addTag returned no id: {res}")
+
+    def add_monitor(self, **kwargs):
+        res = self.sio.call("add", kwargs, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"add monitor failed: {res}")
+        self._refresh_monitor_list()
+        return {"monitorID": res.get("monitorID")}
+
+    def edit_monitor(self, monitor_id, **kwargs):
+        # v2 editMonitor expects the full monitor object; merge changes onto the
+        # cached one so we don't blank unset fields.
+        data = self._find_cached(monitor_id)
+        data.update(kwargs)
+        data["id"] = monitor_id
+        res = self.sio.call("editMonitor", data, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"editMonitor failed: {res}")
+        self._refresh_monitor_list()
+        return res
+
+    def delete_monitor(self, monitor_id):
+        res = self.sio.call("deleteMonitor", monitor_id, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"deleteMonitor failed: {res}")
+        self._refresh_monitor_list()
+        return res
+
+    def add_monitor_tag(self, tag_id, monitor_id, value=""):
+        res = self.sio.call(
+            "addMonitorTag", (tag_id, monitor_id, value), timeout=self.timeout
+        )
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"addMonitorTag failed: {res}")
+        return res
+
+    def disconnect(self):
+        try:
+            self.sio.disconnect()
+        except Exception:
+            pass
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -30,7 +169,6 @@ ANNOTATION_ENABLED = "uptime-kuma.io/monitor"
 ANNOTATION_TYPE = "uptime-kuma.io/monitor-type"
 ANNOTATION_INTERVAL = "uptime-kuma.io/monitor-interval"
 ANNOTATION_GROUP = "uptime-kuma.io/monitor-group"
-ANNOTATION_PATH = "uptime-kuma.io/monitor-path"
 MANAGED_TAG = "managed-by-reconciler"
 STATIC_MONITORS_PATH = "/config/monitors.yaml"
 
@@ -74,23 +212,16 @@ def ensure_tag(api):
     return result["id"]
 
 
-def build_group_cache(api):
-    cache = {}
-    for m in api.get_monitors():
-        if m.get("type") == MonitorType.GROUP:
-            cache[m["name"]] = m["id"]
-    return cache
-
-
-def ensure_group(api, group_name, cache):
+def ensure_group(api, group_name):
     if not group_name:
         return None
-    if group_name in cache:
-        return cache[group_name]
+    monitors = api.get_monitors()
+    for m in monitors:
+        if m.get("type") == MonitorType.GROUP and m.get("name") == group_name:
+            return m["id"]
     result = api.add_monitor(type=MonitorType.GROUP, name=group_name)
     log.info("Created monitor group: %s", group_name)
-    cache[group_name] = result["monitorID"]
-    return cache[group_name]
+    return result["monitorID"]
 
 
 def extract_url_from_resource(resource):
@@ -133,7 +264,7 @@ def build_monitor_key(resource):
     return f"{ns}/{kind}/{name}"
 
 
-def reconcile_resource(api, resource, managed, tag_id, group_cache):
+def reconcile_resource(api, resource, managed, tag_id):
     annotations = resource.get("metadata", {}).get("annotations") or {}
     enabled = annotations.get(ANNOTATION_ENABLED, "").lower() == "true"
     key = build_monitor_key(resource)
@@ -152,15 +283,11 @@ def reconcile_resource(api, resource, managed, tag_id, group_cache):
         log.warning("Cannot extract URL from %s, skipping", key)
         return
 
-    path = annotations.get(ANNOTATION_PATH, "")
-    if path:
-        url = url.rstrip("/") + "/" + path.lstrip("/")
-
     monitor_type_str = annotations.get(ANNOTATION_TYPE, "http").lower()
     monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
     interval = int(annotations.get(ANNOTATION_INTERVAL, "60"))
     group_name = annotations.get(ANNOTATION_GROUP, "")
-    parent_id = ensure_group(api, group_name, group_cache) if group_name else None
+    parent_id = ensure_group(api, group_name) if group_name else None
 
     if key in managed:
         existing = managed[key]
@@ -214,7 +341,7 @@ def load_static_monitors():
         return []
 
 
-def reconcile_static_monitors(api, managed, tag_id, group_cache):
+def reconcile_static_monitors(api, managed, tag_id):
     """Create/update monitors from static definitions."""
     static_defs = load_static_monitors()
     seen_keys = set()
@@ -231,7 +358,7 @@ def reconcile_static_monitors(api, managed, tag_id, group_cache):
         monitor_type = MONITOR_TYPES.get(monitor_type_str, MonitorType.HTTP)
         interval = int(entry.get("interval", 60))
         group_name = entry.get("group", "")
-        parent_id = ensure_group(api, group_name, group_cache) if group_name else None
+        parent_id = ensure_group(api, group_name) if group_name else None
 
         kwargs = dict(
             type=monitor_type,
@@ -315,86 +442,76 @@ def full_reconcile(api, tag_id):
     except config.ConfigException:
         config.load_kube_config()
 
-    k8s_client = None
+    v1net = client.NetworkingV1Api()
+    custom = client.CustomObjectsApi()
+
+    managed = get_managed_monitors(api)
+    seen_keys = set()
+
+    # --- Static monitors from ConfigMap ---
+    static_keys = reconcile_static_monitors(api, managed, tag_id)
+    seen_keys.update(static_keys)
+
+    # --- Auto-discovered Kubernetes resources ---
+
+    # Standard Ingress resources
     try:
-        k8s_client = client.ApiClient()
-        v1net = client.NetworkingV1Api(api_client=k8s_client)
-        custom = client.CustomObjectsApi(api_client=k8s_client)
+        ingresses = v1net.list_ingress_for_all_namespaces()
+        for ing in ingresses.items:
+            resource = {
+                "kind": "Ingress",
+                "metadata": {
+                    "name": ing.metadata.name,
+                    "namespace": ing.metadata.namespace,
+                    "annotations": ing.metadata.annotations or {},
+                },
+                "spec": client.ApiClient().sanitize_for_serialization(ing.spec),
+            }
+            key = build_monitor_key(resource)
+            seen_keys.add(key)
+            reconcile_resource(api, resource, managed, tag_id)
+    except Exception as e:
+        log.error("Error listing Ingresses: %s", e)
 
-        managed = get_managed_monitors(api)
-        group_cache = build_group_cache(api)
-        seen_keys = set()
-
-        # --- Static monitors from ConfigMap ---
-        static_keys = reconcile_static_monitors(api, managed, tag_id, group_cache)
-        seen_keys.update(static_keys)
-
-        # --- Auto-discovered Kubernetes resources ---
-
-        # Standard Ingress resources
-        try:
-            ingresses = v1net.list_ingress_for_all_namespaces()
-            for ing in ingresses.items:
-                resource = {
-                    "kind": "Ingress",
-                    "metadata": {
-                        "name": ing.metadata.name,
-                        "namespace": ing.metadata.namespace,
-                        "annotations": ing.metadata.annotations or {},
-                    },
-                    "spec": k8s_client.sanitize_for_serialization(ing.spec),
-                }
-                key = build_monitor_key(resource)
-                seen_keys.add(key)
-                reconcile_resource(api, resource, managed, tag_id, group_cache)
-        except Exception as e:
-            log.error("Error listing Ingresses: %s", e)
-
-        # Traefik IngressRoute CRDs
-        try:
-            ingressroutes = custom.list_cluster_custom_object(
-                "traefik.io", "v1alpha1", "ingressroutes"
-            )
-            for ir in ingressroutes.get("items", []):
-                ir["kind"] = "IngressRoute"
-                key = build_monitor_key(ir)
-                seen_keys.add(key)
-                reconcile_resource(api, ir, managed, tag_id, group_cache)
-        except Exception as e:
-            log.debug("IngressRoute CRD not available: %s", e)
-
-        # Gateway API HTTPRoute
-        try:
-            httproutes = custom.list_cluster_custom_object(
-                "gateway.networking.k8s.io", "v1", "httproutes"
-            )
-            for hr in httproutes.get("items", []):
-                hr["kind"] = "HTTPRoute"
-                key = build_monitor_key(hr)
-                seen_keys.add(key)
-                reconcile_resource(api, hr, managed, tag_id, group_cache)
-        except Exception as e:
-            log.debug("HTTPRoute CRD not available: %s", e)
-
-        # Delete monitors for resources that no longer exist
-        for key, monitor in managed.items():
-            if key not in seen_keys:
-                log.info("Deleting orphan monitor %s (resource gone)", key)
-                try:
-                    api.delete_monitor(monitor["id"])
-                except Exception as e:
-                    log.error("Failed to delete orphan monitor %s: %s", key, e)
-
-        log.info(
-            "Full reconciliation complete. Tracked %d resources (%d static, %d discovered).",
-            len(seen_keys), len(static_keys), len(seen_keys) - len(static_keys),
+    # Traefik IngressRoute CRDs
+    try:
+        ingressroutes = custom.list_cluster_custom_object(
+            "traefik.io", "v1alpha1", "ingressroutes"
         )
-    finally:
-        if k8s_client is not None:
+        for ir in ingressroutes.get("items", []):
+            ir["kind"] = "IngressRoute"
+            key = build_monitor_key(ir)
+            seen_keys.add(key)
+            reconcile_resource(api, ir, managed, tag_id)
+    except Exception as e:
+        log.debug("IngressRoute CRD not available: %s", e)
+
+    # Gateway API HTTPRoute
+    try:
+        httproutes = custom.list_cluster_custom_object(
+            "gateway.networking.k8s.io", "v1", "httproutes"
+        )
+        for hr in httproutes.get("items", []):
+            hr["kind"] = "HTTPRoute"
+            key = build_monitor_key(hr)
+            seen_keys.add(key)
+            reconcile_resource(api, hr, managed, tag_id)
+    except Exception as e:
+        log.debug("HTTPRoute CRD not available: %s", e)
+
+    # Delete monitors for resources that no longer exist
+    for key, monitor in managed.items():
+        if key not in seen_keys:
+            log.info("Deleting orphan monitor %s (resource gone)", key)
             try:
-                k8s_client.close()
-            except Exception:
-                pass
+                api.delete_monitor(monitor["id"])
+            except Exception as e:
+                log.error("Failed to delete orphan monitor %s: %s", key, e)
+
+    log.info(
+        "Full reconciliation complete. Tracked %d resources (%d static, %d discovered).",
+        len(seen_keys), len(static_keys), len(seen_keys) - len(static_keys),
+    )
 
 
 def watch_loop(api, tag_id):

@@ -16,9 +16,148 @@ import sys
 import time
 from threading import Event
 
+import threading
+
+import socketio
 import yaml
 from kubernetes import client, config, watch
-from uptime_kuma_api import UptimeKumaApi, MonitorType
+
+
+# ---------------------------------------------------------------------------
+# Uptime Kuma v2 Socket.IO client (replaces lucasheld/uptime-kuma-api).
+#
+# uptime-kuma-api only supports Uptime Kuma <= 1.23.2. v2 changed the login
+# handshake — the "login" ack now returns {ok, tokenRequired} instead of the
+# v1 shape — so the old library connects but never authenticates, and every
+# write fails with "You are not logged in". This minimal client speaks the v2
+# protocol directly and exposes just the surface the reconciler uses.
+# ---------------------------------------------------------------------------
+class MonitorType:
+    HTTP = "http"
+    KEYWORD = "keyword"
+    PING = "ping"
+    PORT = "port"
+    GROUP = "group"
+
+
+class UptimeKumaApi:
+    def __init__(self, url, timeout=30):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self._monitor_list = {}
+        self._ml_event = threading.Event()
+        self.sio = socketio.Client(
+            reconnection=False, logger=False, engineio_logger=False
+        )
+
+        @self.sio.on("monitorList")
+        def _on_monitor_list(data):
+            self._monitor_list = data or {}
+            self._ml_event.set()
+
+        self.sio.connect(
+            self.url,
+            socketio_path="socket.io",
+            transports=["websocket", "polling"],
+            wait=True,
+            wait_timeout=timeout,
+        )
+
+    def login(self, username, password, token=""):
+        payload = {"username": username, "password": password}
+        if token:
+            payload["token"] = token
+        res = self.sio.call("login", payload, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            if isinstance(res, dict) and res.get("tokenRequired"):
+                raise RuntimeError(
+                    "Uptime Kuma requires 2FA but no token is configured"
+                )
+            raise RuntimeError(f"login failed: {res}")
+        # Server auto-pushes monitorList after a successful login.
+        self._ml_event.wait(self.timeout)
+        return res
+
+    def _refresh_monitor_list(self):
+        """Best-effort wait for the server to push an updated monitorList
+        after a mutation, so the next get_monitors() reflects the change."""
+        self._ml_event.clear()
+        self._ml_event.wait(2)
+
+    def get_monitors(self):
+        monitors = []
+        for mid, m in (self._monitor_list or {}).items():
+            mm = dict(m)
+            mm.setdefault("id", int(mid) if str(mid).isdigit() else mid)
+            monitors.append(mm)
+        return monitors
+
+    def _find_cached(self, monitor_id):
+        for mid, m in (self._monitor_list or {}).items():
+            cid = int(mid) if str(mid).isdigit() else mid
+            if cid == monitor_id:
+                return dict(m)
+        return {}
+
+    def get_tags(self):
+        res = self.sio.call("getTags", timeout=self.timeout)
+        if isinstance(res, dict):
+            return res.get("tags", [])
+        return res or []
+
+    def add_tag(self, name, color):
+        res = self.sio.call(
+            "addTag", {"name": name, "color": color}, timeout=self.timeout
+        )
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"addTag failed: {res}")
+        tag = res.get("tag")
+        if isinstance(tag, dict) and "id" in tag:
+            return tag
+        for t in self.get_tags():  # fallback: resolve id by name
+            if t.get("name") == name:
+                return t
+        raise RuntimeError(f"addTag returned no id: {res}")
+
+    def add_monitor(self, **kwargs):
+        res = self.sio.call("add", kwargs, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"add monitor failed: {res}")
+        self._refresh_monitor_list()
+        return {"monitorID": res.get("monitorID")}
+
+    def edit_monitor(self, monitor_id, **kwargs):
+        # v2 editMonitor expects the full monitor object; merge changes onto the
+        # cached one so we don't blank unset fields.
+        data = self._find_cached(monitor_id)
+        data.update(kwargs)
+        data["id"] = monitor_id
+        res = self.sio.call("editMonitor", data, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"editMonitor failed: {res}")
+        self._refresh_monitor_list()
+        return res
+
+    def delete_monitor(self, monitor_id):
+        res = self.sio.call("deleteMonitor", monitor_id, timeout=self.timeout)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"deleteMonitor failed: {res}")
+        self._refresh_monitor_list()
+        return res
+
+    def add_monitor_tag(self, tag_id, monitor_id, value=""):
+        res = self.sio.call(
+            "addMonitorTag", (tag_id, monitor_id, value), timeout=self.timeout
+        )
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(f"addMonitorTag failed: {res}")
+        return res
+
+    def disconnect(self):
+        try:
+            self.sio.disconnect()
+        except Exception:
+            pass
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
