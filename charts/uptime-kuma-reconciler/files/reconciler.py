@@ -40,6 +40,46 @@ class MonitorType:
     GROUP = "group"
 
 
+# v2's "add"/"editMonitor" expect a full monitor object — the server iterates
+# array fields (e.g. accepted_statuscodes, conditions) with .every(), so a
+# partial payload fails with "Cannot read properties of undefined (reading
+# 'every')". v1's uptime-kuma-api filled these in for us; now we do it here.
+V2_MONITOR_DEFAULTS = {
+    "type": "http", "name": "", "description": None, "url": "", "method": "GET",
+    "hostname": None, "port": None, "maxretries": 3, "weight": 2000,
+    "active": True, "timeout": 48, "interval": 60, "retryInterval": 60,
+    "resendInterval": 0, "keyword": "", "invertKeyword": False,
+    "expiryNotification": False, "ignoreTls": False, "upsideDown": False,
+    "packetSize": 56, "maxredirects": 10,
+    "accepted_statuscodes": ["200-299"], "accepted_statuscodes_json": '["200-299"]',
+    "dns_resolve_type": "A", "dns_resolve_server": "1.1.1.1",
+    "dns_last_result": None, "docker_container": "", "docker_host": None,
+    "proxyId": None, "notificationIDList": {}, "mqttTopic": "",
+    "mqttSuccessMessage": "", "mqttCheckType": "keyword", "databaseQuery": None,
+    "authMethod": None, "grpcUrl": None, "grpcProtobuf": None, "grpcMethod": None,
+    "grpcServiceName": None, "grpcEnableTls": False, "radiusCalledStationId": None,
+    "radiusCallingStationId": None, "game": None, "gamedigGivenPortOnly": True,
+    "httpBodyEncoding": "json", "jsonPath": None, "expectedValue": None,
+    "kafkaProducerTopic": None, "kafkaProducerBrokers": [],
+    "kafkaProducerSsl": False, "kafkaProducerAllowAutoTopicCreation": False,
+    "kafkaProducerMessage": None, "cacheBust": False, "remote_browser": None,
+    "snmpOid": None, "jsonPathOperator": "==", "snmpVersion": "2c",
+    "smtpSecurity": None, "rabbitmqNodes": None, "conditions": [],
+    "ipFamily": None, "ping_numeric": True, "ping_count": 1,
+    "ping_per_request_timeout": 2, "headers": None, "body": None,
+    "grpcBody": None, "grpcMetadata": None, "basic_auth_user": None,
+    "basic_auth_pass": None, "oauth_client_id": None, "oauth_client_secret": None,
+    "oauth_token_url": None, "oauth_scopes": None, "oauth_audience": None,
+    "oauth_auth_method": "client_secret_basic", "pushToken": None,
+    "databaseConnectionString": None, "radiusUsername": None,
+    "radiusPassword": None, "radiusSecret": None, "mqttUsername": "",
+    "mqttPassword": "", "mqttWebsocketPath": None, "authWorkstation": None,
+    "authDomain": None, "tlsCa": None, "tlsCert": None, "tlsKey": None,
+    "kafkaProducerSaslOptions": {"mechanism": "None"}, "rabbitmqUsername": None,
+    "rabbitmqPassword": None,
+}
+
+
 class UptimeKumaApi:
     def __init__(self, url, timeout=30):
         self.url = url.rstrip("/")
@@ -120,17 +160,19 @@ class UptimeKumaApi:
         raise RuntimeError(f"addTag returned no id: {res}")
 
     def add_monitor(self, **kwargs):
-        res = self.sio.call("add", kwargs, timeout=self.timeout)
+        payload = {**V2_MONITOR_DEFAULTS, **kwargs}
+        payload.pop("tags", None)  # add rejects tags; applied separately
+        res = self.sio.call("add", payload, timeout=self.timeout)
         if not (isinstance(res, dict) and res.get("ok")):
             raise RuntimeError(f"add monitor failed: {res}")
         self._refresh_monitor_list()
         return {"monitorID": res.get("monitorID")}
 
     def edit_monitor(self, monitor_id, **kwargs):
-        # v2 editMonitor expects the full monitor object; merge changes onto the
-        # cached one so we don't blank unset fields.
-        data = self._find_cached(monitor_id)
-        data.update(kwargs)
+        # v2 editMonitor expects the full monitor object; layer defaults <-
+        # cached current <- changes so nothing required is left undefined.
+        data = {**V2_MONITOR_DEFAULTS, **self._find_cached(monitor_id), **kwargs}
+        data.pop("tags", None)
         data["id"] = monitor_id
         res = self.sio.call("editMonitor", data, timeout=self.timeout)
         if not (isinstance(res, dict) and res.get("ok")):
