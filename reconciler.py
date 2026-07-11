@@ -236,13 +236,31 @@ def connect_kuma(url, username, password):
     return api
 
 
-def get_managed_monitors(api):
+def get_managed_monitors(api, tag_id=None):
+    """Return monitors managed by the reconciler, keyed by name.
+
+    If *tag_id* is provided, any monitor whose name matches the reconciler
+    naming convention (``namespace/Kind/name`` or ``static/name``) but is
+    missing the managed tag is *adopted*: the tag is applied so that future
+    reconcile cycles recognise it.  This prevents duplicate monitors from
+    accumulating when the reconciler restarts after crashing between
+    ``add_monitor`` and ``add_monitor_tag``.
+    """
     monitors = api.get_monitors()
     managed = {}
     for m in monitors:
-        tags = [t.get("name", "") for t in m.get("tags", [])]
+        name = m.get("name", "")
+        tags = [t.get("name", "") for t in (m.get("tags") or [])]
         if MANAGED_TAG in tags:
-            managed[m["name"]] = m
+            managed[name] = m
+        elif tag_id is not None and "/" in name:
+            # Looks like a reconciler-managed name that lost its tag.
+            log.info("Adopting untagged monitor %r (id=%s)", name, m.get("id"))
+            try:
+                api.add_monitor_tag(tag_id, m["id"])
+                managed[name] = m
+            except Exception as e:
+                log.warning("Failed to adopt monitor %r: %s", name, e)
     return managed
 
 
@@ -487,7 +505,7 @@ def full_reconcile(api, tag_id):
     v1net = client.NetworkingV1Api()
     custom = client.CustomObjectsApi()
 
-    managed = get_managed_monitors(api)
+    managed = get_managed_monitors(api, tag_id)
     seen_keys = set()
 
     # --- Static monitors from ConfigMap ---
