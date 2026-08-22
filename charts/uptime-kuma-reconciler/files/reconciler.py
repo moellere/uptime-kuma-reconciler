@@ -1,9 +1,10 @@
 """
 Uptime Kuma auto-discovery reconciler.
 
-Watches Ingress, IngressRoute (Traefik), and HTTPRoute (Gateway API) resources
-for the annotation `uptime-kuma.io/monitor: "true"` and automatically creates,
-updates, and deletes HTTP monitors in Uptime Kuma.
+Watches Ingress, IngressRoute (Traefik), HTTPRoute (Gateway API), and
+VirtualService (Istio) resources for the annotation
+`uptime-kuma.io/monitor: "true"` and automatically creates, updates, and
+deletes HTTP monitors in Uptime Kuma.
 
 Also reconciles static monitors defined in /config/monitors.yaml for
 non-Kubernetes hosts (Proxmox nodes, VMs, network gateways, etc.).
@@ -236,13 +237,31 @@ def connect_kuma(url, username, password):
     return api
 
 
-def get_managed_monitors(api):
+def get_managed_monitors(api, tag_id=None):
+    """Return monitors managed by the reconciler, keyed by name.
+
+    If *tag_id* is provided, any monitor whose name matches the reconciler
+    naming convention (``namespace/Kind/name`` or ``static/name``) but is
+    missing the managed tag is *adopted*: the tag is applied so that future
+    reconcile cycles recognise it.  This prevents duplicate monitors from
+    accumulating when the reconciler restarts after crashing between
+    ``add_monitor`` and ``add_monitor_tag``.
+    """
     monitors = api.get_monitors()
     managed = {}
     for m in monitors:
-        tags = [t.get("name", "") for t in m.get("tags", [])]
+        name = m.get("name", "")
+        tags = [t.get("name", "") for t in (m.get("tags") or [])]
         if MANAGED_TAG in tags:
-            managed[m["name"]] = m
+            managed[name] = m
+        elif tag_id is not None and "/" in name:
+            # Looks like a reconciler-managed name that lost its tag.
+            log.info("Adopting untagged monitor %r (id=%s)", name, m.get("id"))
+            try:
+                api.add_monitor_tag(tag_id, m["id"])
+                managed[name] = m
+            except Exception as e:
+                log.warning("Failed to adopt monitor %r: %s", name, e)
     return managed
 
 
@@ -294,6 +313,11 @@ def extract_url_from_resource(resource):
     elif kind == "HTTPRoute":
         for hostname in spec.get("hostnames") or []:
             return f"https://{hostname}"
+
+    elif kind == "VirtualService":
+        for host in spec.get("hosts") or []:
+            if host and host != "*":
+                return f"https://{host}"
 
     return None
 
@@ -487,7 +511,7 @@ def full_reconcile(api, tag_id):
     v1net = client.NetworkingV1Api()
     custom = client.CustomObjectsApi()
 
-    managed = get_managed_monitors(api)
+    managed = get_managed_monitors(api, tag_id)
     seen_keys = set()
 
     # --- Static monitors from ConfigMap ---
@@ -540,6 +564,19 @@ def full_reconcile(api, tag_id):
             reconcile_resource(api, hr, managed, tag_id)
     except Exception as e:
         log.debug("HTTPRoute CRD not available: %s", e)
+
+    # Istio VirtualService
+    try:
+        virtualservices = custom.list_cluster_custom_object(
+            "networking.istio.io", "v1", "virtualservices"
+        )
+        for vs in virtualservices.get("items", []):
+            vs["kind"] = "VirtualService"
+            key = build_monitor_key(vs)
+            seen_keys.add(key)
+            reconcile_resource(api, vs, managed, tag_id)
+    except Exception as e:
+        log.debug("VirtualService CRD not available: %s", e)
 
     # Delete monitors for resources that no longer exist
     for key, monitor in managed.items():
