@@ -1,8 +1,8 @@
 # Uptime Kuma Reconciler
 
-A Kubernetes controller that automatically discovers Ingress resources and manages [Uptime Kuma](https://github.com/louislam/uptime-kuma) monitors. It bridges the gap between your Kubernetes infrastructure and Uptime Kuma by providing:
+A Kubernetes controller that automatically discovers Ingress and Istio VirtualService resources and manages [Uptime Kuma](https://github.com/louislam/uptime-kuma) monitors. It bridges the gap between your Kubernetes infrastructure and Uptime Kuma by providing:
 
-- **Auto-discovery** — Monitors are created automatically for any Ingress, Traefik IngressRoute, or Gateway API HTTPRoute annotated with `uptime-kuma.io/monitor: "true"`
+- **Auto-discovery** — Monitors are created automatically for any Ingress, Traefik IngressRoute, Gateway API HTTPRoute, or Istio VirtualService annotated with `uptime-kuma.io/monitor: "true"`
 - **Static monitors** — Define monitors for non-Kubernetes hosts (network devices, VMs, databases) via a simple YAML ConfigMap
 - **Reconciliation loop** — Continuously syncs state, creating new monitors, updating changed ones, and removing orphans
 - **Safe tagging** — All managed monitors are tagged with `managed-by-reconciler` so manually-created monitors are never touched
@@ -16,6 +16,7 @@ A Kubernetes controller that automatically discovers Ingress resources and manag
 | Ingress auto-discovery | ✅ | ✅ |
 | Traefik IngressRoute | ✅ | ✅ |
 | **Gateway API HTTPRoute** | ❌ | ✅ |
+| **Istio VirtualService** | ❌ | ✅ |
 | **Ping monitors** (VMs, network devices) | ❌ | ✅ |
 | **Port monitors** (SSH, MQTT, databases) | ❌ | ✅ |
 | **Monitor grouping** | ❌ | ✅ |
@@ -29,7 +30,7 @@ If you only need HTTP monitoring for Kubernetes Ingresses, kuma-ingress-watcher 
 The reconciler runs as a single-replica Deployment inside your cluster. Every reconciliation cycle (default: 5 minutes) it:
 
 1. Connects to Uptime Kuma via the [uptime-kuma-api](https://github.com/lucasheld/uptime-kuma-api) Python library
-2. Lists all Ingress, IngressRoute (Traefik), and HTTPRoute (Gateway API) resources across all namespaces
+2. Lists all Ingress, IngressRoute (Traefik), HTTPRoute (Gateway API), and VirtualService (Istio) resources across all namespaces
 3. For each resource with `uptime-kuma.io/monitor: "true"`, creates or updates an HTTP monitor
 4. Loads static monitor definitions from a mounted ConfigMap
 5. Deletes any managed monitors whose source resource no longer exists
@@ -114,7 +115,7 @@ staticMonitors:
 
 ## Annotations
 
-Add these annotations to your Ingress, IngressRoute, or HTTPRoute resources:
+Add these annotations to your Ingress, IngressRoute, HTTPRoute, or VirtualService resources:
 
 | Annotation | Required | Default | Description |
 |---|---|---|---|
@@ -149,6 +150,30 @@ spec:
                 name: my-app
                 port:
                   number: 80
+```
+
+### Example Istio VirtualService
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: my-app
+  annotations:
+    uptime-kuma.io/monitor: "true"
+    uptime-kuma.io/monitor-interval: "30"
+    uptime-kuma.io/monitor-group: "Mesh Services"
+spec:
+  hosts:
+    - app.example.com
+  gateways:
+    - my-gateway
+  http:
+    - route:
+        - destination:
+            host: my-app
+            port:
+              number: 80
 ```
 
 ## Static Monitors
@@ -188,6 +213,7 @@ See [examples/](examples/) for more complete examples.
 | Ingress | `networking.k8s.io/v1` | Standard Kubernetes Ingress |
 | IngressRoute | `traefik.io/v1alpha1` | Traefik CRD |
 | HTTPRoute | `gateway.networking.k8s.io/v1` | Gateway API |
+| VirtualService | `networking.istio.io/v1` | Istio; URL derived from the first non-wildcard `spec.hosts` entry, always `https://` |
 
 ## Monitor Naming
 
@@ -210,6 +236,9 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
     verbs: ["get", "list", "watch"]
 ```
 

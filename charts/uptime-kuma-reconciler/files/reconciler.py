@@ -1,9 +1,10 @@
 """
 Uptime Kuma auto-discovery reconciler.
 
-Watches Ingress, IngressRoute (Traefik), and HTTPRoute (Gateway API) resources
-for the annotation `uptime-kuma.io/monitor: "true"` and automatically creates,
-updates, and deletes HTTP monitors in Uptime Kuma.
+Watches Ingress, IngressRoute (Traefik), HTTPRoute (Gateway API), and
+VirtualService (Istio) resources for the annotation
+`uptime-kuma.io/monitor: "true"` and automatically creates, updates, and
+deletes HTTP monitors in Uptime Kuma.
 
 Also reconciles static monitors defined in /config/monitors.yaml for
 non-Kubernetes hosts (Proxmox nodes, VMs, network gateways, etc.).
@@ -337,6 +338,11 @@ def extract_url_from_resource(resource):
         for hostname in spec.get("hostnames") or []:
             return f"https://{hostname}"
 
+    elif kind == "VirtualService":
+        for host in spec.get("hosts") or []:
+            if host and host != "*":
+                return f"https://{host}"
+
     return None
 
 
@@ -599,6 +605,19 @@ def full_reconcile(api, tag_id):
             reconcile_resource(api, hr, managed, tag_id)
     except Exception as e:
         log.debug("HTTPRoute CRD not available: %s", e)
+
+    # Istio VirtualService
+    try:
+        virtualservices = custom.list_cluster_custom_object(
+            "networking.istio.io", "v1", "virtualservices"
+        )
+        for vs in virtualservices.get("items", []):
+            vs["kind"] = "VirtualService"
+            key = build_monitor_key(vs)
+            seen_keys.add(key)
+            reconcile_resource(api, vs, managed, tag_id)
+    except Exception as e:
+        log.debug("VirtualService CRD not available: %s", e)
 
     # Delete monitors for resources that no longer exist
     for key, monitor in managed.items():

@@ -1,0 +1,36 @@
+# Example Istio VirtualService with Uptime Kuma reconciler annotations
+#
+# The reconciler will automatically create an HTTP monitor in Uptime Kuma
+# for any VirtualService with the `uptime-kuma.io/monitor: "true"` annotation.
+# The monitor URL is derived from the first non-wildcard entry in spec.hosts,
+# always with the https:// scheme (VirtualService itself carries no TLS
+# information — termination happens on the referenced Gateway).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: my-app
+  namespace: default
+  annotations:
+    # Required: enable auto-discovery for this VirtualService
+    uptime-kuma.io/monitor: "true"
+
+    # Optional: monitor type (default: http)
+    # Supported: http, keyword, ping, port
+    uptime-kuma.io/monitor-type: "http"
+
+    # Optional: check interval in seconds (default: 60)
+    uptime-kuma.io/monitor-interval: "30"
+
+    # Optional: group name in Uptime Kuma (creates group if it doesn't exist)
+    uptime-kuma.io/monitor-group: "Mesh Services"
+spec:
+  hosts:
+    - app.example.com
+  gateways:
+    - my-gateway
+  http:
+    - route:
+        - destination:
+            host: my-app
+            port:
+              number: 80
